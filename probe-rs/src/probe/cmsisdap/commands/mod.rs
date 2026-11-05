@@ -455,6 +455,26 @@ impl CmsisDapDevice {
             }
         }
 
+        // Some CMSIS-DAP v1 firmware (several DAPLink clones among them) does
+        // not implement DAP_Info(ID_PACKET_SIZE) and simply never answers it.
+        // For those probes the HID report descriptor already gave us the
+        // correct output report size, so fall back to it instead of refusing
+        // to open an otherwise perfectly usable debug probe.
+        #[cfg(feature = "cmsisdap_v1")]
+        let hid_fallback = match &self {
+            CmsisDapDevice::V1 { report_size, .. } if *report_size > 0 => Some(*report_size),
+            _ => None,
+        };
+        #[cfg(feature = "cmsisdap_v1")]
+        if let Some(size) = hid_fallback {
+            tracing::warn!(
+                "DAP_Info(PacketSize) is unsupported by this probe; \
+                 falling back to its HID report size of {size} bytes"
+            );
+            self.set_usb_timeout(old_timeout);
+            return Ok(size);
+        }
+
         // If we didn't return early, no sizes worked, report an error.
         Err(CmsisDapError::NoPacketSize)
     }
