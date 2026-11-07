@@ -242,12 +242,20 @@ impl CmsisDap {
         // again for as long as the answers look like they belong to someone else.
         let mut info = Self::read_probe_info(&mut device);
         for _ in 1..MAX_OPEN_ATTEMPTS {
-            if !matches!(&info, Err(e) if commands::reply_is_not_ours(e)) {
+            let out_of_step = matches!(&info, Err(e) if commands::reply_is_not_ours(e));
+            let silent = matches!(&info, Err(e) if commands::probe_timed_out(e));
+            if !out_of_step && !silent {
                 break;
             }
 
             device.drain_idle_for(BACKLOG_IDLE);
-            device.resynchronise();
+            if out_of_step {
+                device.resynchronise();
+            } else {
+                // A probe still finishing the previous session's work answers
+                // late. Give the USB firmware a moment before asking again.
+                std::thread::sleep(Duration::from_millis(150));
+            }
             info = Self::read_probe_info(&mut device);
         }
 

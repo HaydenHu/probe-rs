@@ -17,7 +17,7 @@ use nusb::{
 };
 use std::io::ErrorKind;
 use std::str::Utf8Error;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use self::general::host_status::HostStatusRequest;
 use self::swj::clock::SWJClockRequest;
@@ -27,6 +27,9 @@ pub(crate) const DEFAULT_USB_TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// Rounds spent bringing replies back into step before giving up on the probe.
 const MAX_RESYNC_ROUNDS: usize = 32;
+
+/// Upper bound on stale replies consumed while waiting for one command's own.
+const MAX_STALE_REPLIES: usize = 16;
 
 /// How long to wait for a reply the probe was prompted to give up.
 const RESYNC_IDLE: Duration = Duration::from_millis(5);
@@ -258,10 +261,45 @@ impl CmsisDapDevice {
                 usb_timeout,
                 ..
             } => {
-                match handle.read_timeout(buf, usb_timeout.as_millis() as i32)? {
-                    // Timeout is not indicated by error, but by returning 0 read bytes
-                    0 => Err(SendError::Timeout),
-                    n => Ok(n),
+                // Some CMSIS-DAP v1 firmware (several DAPLink clones among
+                // them) emits all-zero HID reports while idle. They are not a
+                // reply to any command, but `read_timeout` still reports them
+                // as received data. Parsing one yields
+                // `CommandIdMismatch(0x0, ...)`, which puts the request/reply
+                // stream out of step and aborts long operations such as a flash
+                // Program halfway through. Skip those filler reports until a
+                // real reply arrives or the normal USB timeout elapses.
+                let deadline = Instant::now() + *usb_timeout;
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(SendError::Timeout);
+                    }
+                    let timeout_ms = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+                    let n = match handle.read_timeout(buf, timeout_ms) {
+                        Ok(n) => n,
+                        Err(err) => {
+                            // On Windows a plain read timeout is reported as a
+                            // HidError ("WinError: WaitTimedOut") rather than as
+                            // zero bytes. Normalise it so the retry/resync path
+                            // can recognise a silent probe as a timeout.
+                            let text = err.to_string().to_lowercase();
+                            if text.contains("timedout") || text.contains("timed out") {
+                                return Err(SendError::Timeout);
+                            }
+                            return Err(err.into());
+                        }
+                    };
+                    match n {
+                        // Timeout is not indicated by error, but by returning 0 read bytes
+                        0 => return Err(SendError::Timeout),
+                        n if buf[..n].iter().all(|byte| *byte == 0) => {
+                            tracing::trace!(
+                                "Ignoring all-zero CMSIS-DAP v1 HID report ({n} bytes)"
+                            );
+                        }
+                        n => return Ok(n),
+                    }
                 }
             }
             // A reply that fills the packet ends on a full USB packet with no short one after it,
@@ -776,12 +814,40 @@ pub(crate) fn send_command<Req: Request>(
     request: &Req,
 ) -> Result<Req::Response, CmsisDapError> {
     let response = send_command_once(device, request);
-    if let Err(error) = &response
-        && may_be_out_of_step(error)
-    {
-        device.resynchronise();
+    let Err(error) = &response else {
+        return response;
+    };
+    if !may_be_out_of_step(error) {
+        return response;
+    }
+
+    device.resynchronise();
+
+    // A stale reply (or an all-zero filler report) means the probe did not
+    // answer *this* request. Control commands are idempotent, so one retry
+    // after resynchronising recovers a flaky CMSIS-DAP v1 link without the
+    // caller ever seeing the error. The data-path commands are deliberately
+    // excluded: repeating a DAP_Transfer would repeat an SWD access, and an
+    // AP DRW write advances the TAR, corrupting the transfer stream.
+    if command_is_retryable(request.command()) {
+        tracing::debug!(
+            "Retrying {:?} after resynchronising the CMSIS-DAP stream",
+            request.command()
+        );
+        return send_command_once(device, request);
     }
     response
+}
+
+fn command_is_retryable(command: CommandId) -> bool {
+    !matches!(
+        command,
+        CommandId::Transfer
+            | CommandId::TransferBlock
+            | CommandId::ExecuteCommands
+            | CommandId::QueueCommands
+            | CommandId::Vendor(_)
+    )
 }
 
 /// Send a request and take its reply, without the recovery of [`send_command`].
@@ -823,6 +889,18 @@ pub(crate) fn reply_is_not_ours(error: &CmsisDapError) -> bool {
             source: SendError::CommandIdMismatch(..)
                 | SendError::UnexpectedAnswer
                 | SendError::NotEnoughData,
+            ..
+        }
+    )
+}
+
+/// Whether the probe stayed silent. A busy DAPLink may need a moment after the
+/// previous session before it answers again, so this is worth retrying at open.
+pub(crate) fn probe_timed_out(error: &CmsisDapError) -> bool {
+    matches!(
+        error,
+        CmsisDapError::Send {
+            source: SendError::Timeout,
             ..
         }
     )
@@ -920,22 +998,37 @@ fn receive_response_inner<Req: Request>(
     request: &Req,
     buffer: &mut [u8],
 ) -> Result<Req::Response, SendError> {
-    let bytes_read = device.read(buffer)?;
-    let response_data = &buffer[..bytes_read];
-    trace_buffer("Receive buffer", response_data);
+    // A CMSIS-DAP v1 probe can still have replies from an earlier session (or
+    // from a command that timed out during packet-size probing) queued in its
+    // HID input endpoint. Those arrive *before* the reply to this command.
+    // Rejecting the first one leaves requests and replies out of step for the
+    // rest of the session, which surfaces as `CommandIdMismatch` in the middle
+    // of a flash program. Consume stale replies until our own arrives. The USB
+    // read timeout bounds the wait when the probe owes us no reply at all.
+    for stale in 0..=MAX_STALE_REPLIES {
+        let bytes_read = device.read(buffer)?;
+        let response_data = &buffer[..bytes_read];
+        trace_buffer("Receive buffer", response_data);
 
-    if response_data.is_empty() {
-        return Err(SendError::NotEnoughData);
-    }
-
-    if response_data[0] == request.command().id() {
-        request.parse_response(&response_data[1..])
-    } else {
-        Err(SendError::CommandIdMismatch(
+        if response_data.is_empty() {
+            return Err(SendError::NotEnoughData);
+        }
+        if response_data[0] == request.command().id() {
+            return request.parse_response(&response_data[1..]);
+        }
+        if stale == MAX_STALE_REPLIES {
+            return Err(SendError::CommandIdMismatch(
+                response_data[0],
+                request.command(),
+            ));
+        }
+        tracing::debug!(
+            "Skipping stale CMSIS-DAP reply {:02x} while waiting for {:02x}",
             response_data[0],
-            request.command(),
-        ))
+            request.command().id()
+        );
     }
+    unreachable!("stale-reply loop always returns")
 }
 
 fn send_command_inner<Req: Request>(
