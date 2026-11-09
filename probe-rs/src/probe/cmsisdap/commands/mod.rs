@@ -8,6 +8,7 @@ pub mod swo;
 pub mod transfer;
 
 use crate::probe::cmsisdap::commands::general::info::{PacketCountCommand, PacketSizeCommand};
+use crate::probe::cmsisdap::elaphurelink::ElaphureLinkDevice;
 use crate::probe::cmsisdap::tcp::TcpDevice;
 use crate::probe::usb_util::{BulkReadExt, BulkWriteExt};
 use crate::probe::{ProbeError, WireProtocol};
@@ -69,6 +70,9 @@ pub enum CmsisDapError {
 
     /// Could not connect to the probe over TCP.
     TcpConnect(#[source] std::io::Error),
+
+    /// Could not connect to or handshake with an elaphureLink proxy.
+    ElaphureLinkConnect(#[source] std::io::Error),
 
     /// Invalid IDCODE detected.
     InvalidIdCode,
@@ -224,6 +228,14 @@ pub enum CmsisDapDevice {
         timeout: Duration,
     },
 
+    /// CMSIS-DAP over an elaphureLink wireless proxy (OpenOCD's
+    /// `cmsis-dap backend elaphurelink` framing).
+    ElaphureLink {
+        device: ElaphureLinkDevice,
+        max_packet_size: usize,
+        timeout: Duration,
+    },
+
     /// A scripted probe for host tests.
     #[cfg(test)]
     Fake(std::sync::Arc<std::sync::Mutex<fake::FakeProbe>>),
@@ -235,7 +247,7 @@ impl CmsisDapDevice {
             #[cfg(feature = "cmsisdap_v1")]
             Self::V1 { usb_timeout, .. } => *usb_timeout,
             Self::V2 { usb_timeout, .. } => *usb_timeout,
-            Self::Tcp { timeout, .. } => *timeout,
+            Self::Tcp { timeout, .. } | Self::ElaphureLink { timeout, .. } => *timeout,
             #[cfg(test)]
             Self::Fake(probe) => probe.lock().unwrap().usb_timeout,
         }
@@ -246,7 +258,7 @@ impl CmsisDapDevice {
             #[cfg(feature = "cmsisdap_v1")]
             Self::V1 { usb_timeout, .. } => *usb_timeout = timeout,
             Self::V2 { usb_timeout, .. } => *usb_timeout = timeout,
-            Self::Tcp { timeout: t, .. } => *t = timeout,
+            Self::Tcp { timeout: t, .. } | Self::ElaphureLink { timeout: t, .. } => *t = timeout,
             #[cfg(test)]
             Self::Fake(probe) => probe.lock().unwrap().usb_timeout = timeout,
         }
@@ -321,6 +333,9 @@ impl CmsisDapDevice {
             CmsisDapDevice::Tcp {
                 device, timeout, ..
             } => Ok(device.read(buf, *timeout)?),
+            CmsisDapDevice::ElaphureLink {
+                device, timeout, ..
+            } => Ok(device.read(buf, *timeout)?),
             #[cfg(test)]
             CmsisDapDevice::Fake(probe) => {
                 let reply = probe.lock().unwrap().read().ok_or(SendError::Timeout)?;
@@ -355,6 +370,7 @@ impl CmsisDapDevice {
             }
             // Skip the HID report byte, as for v2.
             CmsisDapDevice::Tcp { device, .. } => Ok(device.write(&buf[1..])?),
+            CmsisDapDevice::ElaphureLink { device, .. } => Ok(device.write(&buf[1..])?),
             #[cfg(test)]
             CmsisDapDevice::Fake(probe) => {
                 probe.lock().unwrap().write(&buf[1..]);
@@ -422,6 +438,17 @@ impl CmsisDapDevice {
                 }
             }
 
+            CmsisDapDevice::ElaphureLink {
+                device,
+                max_packet_size,
+                ..
+            } => {
+                let mut discard = vec![0u8; *max_packet_size];
+                while device.read(&mut discard, idle).is_ok() {
+                    drained = true;
+                }
+            }
+
             #[cfg(test)]
             CmsisDapDevice::Fake(probe) => drained = probe.lock().unwrap().drain(),
         }
@@ -443,6 +470,9 @@ impl CmsisDapDevice {
                 max_packet_size, ..
             }
             | CmsisDapDevice::Tcp {
+                max_packet_size, ..
+            }
+            | CmsisDapDevice::ElaphureLink {
                 max_packet_size, ..
             } => {
                 *max_packet_size = packet_size;
@@ -510,6 +540,23 @@ impl CmsisDapDevice {
                  falling back to its HID report size of {size} bytes"
             );
             self.set_usb_timeout(old_timeout);
+            return Ok(size);
+        }
+
+        // elaphureLink proxies size their packets for an Ethernet MTU.
+        // OpenOCD fixes the size at 1496 without asking DAP_Info(PacketSize),
+        // so do the same when a proxy never answers that command.
+        let network_fallback = match &self {
+            CmsisDapDevice::ElaphureLink { .. } => Some(1496),
+            _ => None,
+        };
+        if let Some(size) = network_fallback {
+            tracing::warn!(
+                "DAP_Info(PacketSize) is unsupported by this elaphureLink proxy; \
+                 falling back to its 1496 byte MTU packet size"
+            );
+            self.set_usb_timeout(old_timeout);
+            self.set_packet_size(size);
             return Ok(size);
         }
 
@@ -595,7 +642,7 @@ impl CmsisDapDevice {
             #[cfg(feature = "cmsisdap_v1")]
             CmsisDapDevice::V1 { .. } => false,
             CmsisDapDevice::V2 { swo_ep, .. } => swo_ep.is_some(),
-            CmsisDapDevice::Tcp { .. } => false,
+            CmsisDapDevice::Tcp { .. } | CmsisDapDevice::ElaphureLink { .. } => false,
             #[cfg(test)]
             CmsisDapDevice::Fake(_) => false,
         }
@@ -627,7 +674,8 @@ impl CmsisDapDevice {
                 }
                 None => Err(CmsisDapError::SwoModeNotAvailable),
             },
-            CmsisDapDevice::Tcp { .. } => Err(CmsisDapError::SwoModeNotAvailable),
+            CmsisDapDevice::Tcp { .. }
+            | CmsisDapDevice::ElaphureLink { .. } => Err(CmsisDapError::SwoModeNotAvailable),
             #[cfg(test)]
             CmsisDapDevice::Fake(_) => Err(CmsisDapError::SwoModeNotAvailable),
         }
@@ -959,6 +1007,9 @@ fn packet_buffer_len(device: &CmsisDapDevice) -> usize {
             max_packet_size, ..
         }
         | CmsisDapDevice::Tcp {
+            max_packet_size, ..
+        }
+        | CmsisDapDevice::ElaphureLink {
             max_packet_size, ..
         } => *max_packet_size + 1,
         #[cfg(test)]

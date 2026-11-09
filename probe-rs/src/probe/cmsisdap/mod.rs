@@ -2,6 +2,7 @@
 mod arm;
 mod cmsis_swd;
 mod commands;
+mod elaphurelink;
 mod tcp;
 mod tools;
 
@@ -86,8 +87,8 @@ impl std::fmt::Display for CmsisDapFactory {
 
 impl ProbeFactory for CmsisDapFactory {
     fn open(&self, selector: &DebugProbeSelector) -> Result<Box<dyn DebugProbe>, DebugProbeError> {
-        let (device, product) = match tcp_address(selector) {
-            Some(address) => (
+        let (device, product) = match network_probe(selector) {
+            Some(NetworkProbe::Tcp(address)) => (
                 CmsisDapDevice::Tcp {
                     device: tcp::TcpDevice::connect(address).map_err(|error| {
                         DebugProbeError::ProbeCouldNotBeCreated(
@@ -95,6 +96,20 @@ impl ProbeFactory for CmsisDapFactory {
                         )
                     })?,
                     // Large enough for the packet size query; the reply to it replaces this.
+                    max_packet_size: 1024,
+                    timeout: commands::DEFAULT_USB_TIMEOUT,
+                },
+                None,
+            ),
+            Some(NetworkProbe::ElaphureLink(address)) => (
+                CmsisDapDevice::ElaphureLink {
+                    device: elaphurelink::ElaphureLinkDevice::connect(address).map_err(|error| {
+                        DebugProbeError::ProbeCouldNotBeCreated(
+                            CmsisDapError::ElaphureLinkConnect(error).into(),
+                        )
+                    })?,
+                    // OpenOCD fixes elaphureLink packets at the 1496 byte MTU,
+                    // but the packet size query still replaces this.
                     max_packet_size: 1024,
                     timeout: commands::DEFAULT_USB_TIMEOUT,
                 },
@@ -125,16 +140,24 @@ impl ProbeFactory for CmsisDapFactory {
         &self,
         selector: Option<&DebugProbeSelector>,
     ) -> Vec<crate::probe::list::ProbeListItem> {
-        // A TCP probe cannot be enumerated, so list it when the selector names one.
+        // A network probe cannot be enumerated, so list it when the selector names one.
         if let Some(selector) = selector
-            && let Some(address) = tcp_address(selector)
+            && let Some(network) = network_probe(selector)
         {
+            let (identifier, vendor_id, product_id) = match &network {
+                NetworkProbe::Tcp(_) => ("CMSIS-DAP TCP", tcp::TCP_VID, tcp::TCP_PID),
+                NetworkProbe::ElaphureLink(_) => (
+                    "elaphureLink (CMSIS-DAP over TCP)",
+                    elaphurelink::ELAPHURELINK_VID,
+                    elaphurelink::ELAPHURELINK_PID,
+                ),
+            };
             return vec![crate::probe::list::ProbeListItem::accessible(
                 crate::probe::DebugProbeInfo {
-                    identifier: "CMSIS-DAP TCP".to_string(),
-                    vendor_id: tcp::TCP_VID,
-                    product_id: tcp::TCP_PID,
-                    serial_number: Some(address.to_string()),
+                    identifier: identifier.to_string(),
+                    vendor_id,
+                    product_id,
+                    serial_number: Some(network.address().to_string()),
                     probe_factory: &Self,
                     is_hid_interface: false,
                     interface: None,
@@ -149,15 +172,37 @@ impl ProbeFactory for CmsisDapFactory {
     }
 }
 
-/// The address of the TCP probe a selector names, if it names one.
-fn tcp_address(selector: &DebugProbeSelector) -> Option<&str> {
-    if selector.vendor_id != tcp::TCP_VID || selector.product_id != tcp::TCP_PID {
-        return None;
+/// A CMSIS-DAP probe reached over the network instead of USB.
+enum NetworkProbe<'a> {
+    /// OpenOCD's `cmsis-dap backend tcp` framing.
+    Tcp(&'a str),
+    /// OpenOCD's `cmsis-dap backend elaphurelink` framing.
+    ElaphureLink(&'a str),
+}
+
+impl NetworkProbe<'_> {
+    fn address(&self) -> &str {
+        match self {
+            Self::Tcp(address) | Self::ElaphureLink(address) => address,
+        }
     }
-    selector
+}
+
+/// Which network backend a selector names, if any. The address is carried in
+/// the serial number, e.g. `0000:0002:dap.local` for an elaphureLink proxy.
+fn network_probe(selector: &DebugProbeSelector) -> Option<NetworkProbe<'_>> {
+    let address = selector
         .serial_number
         .as_deref()
-        .filter(|address| !address.is_empty())
+        .filter(|address| !address.is_empty())?;
+    if selector.vendor_id != tcp::TCP_VID {
+        return None;
+    }
+    match selector.product_id {
+        tcp::TCP_PID => Some(NetworkProbe::Tcp(address)),
+        elaphurelink::ELAPHURELINK_PID => Some(NetworkProbe::ElaphureLink(address)),
+        _ => None,
+    }
 }
 
 /// A CMSIS-DAP probe.
@@ -963,6 +1008,10 @@ impl DebugProbe for CmsisDap {
 
             CmsisDapDevice::Tcp { device, .. } => {
                 format!("CMSIS-DAP TCP {}", device.address()).leak()
+            }
+
+            CmsisDapDevice::ElaphureLink { device, .. } => {
+                format!("elaphureLink {}", device.address()).leak()
             }
 
             #[cfg(test)]
