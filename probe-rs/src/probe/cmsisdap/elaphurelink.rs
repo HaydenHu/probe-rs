@@ -59,8 +59,27 @@ impl ElaphureLinkDevice {
     /// Connect to `address`, given as `host`, `host:port` or `[ipv6]:port`,
     /// and complete the elaphureLink handshake.
     pub fn connect(address: &str) -> io::Result<Self> {
-        let mut last_error = io::Error::new(ErrorKind::NotFound, "address resolved to nothing");
-        for socket_address in resolve(address)? {
+        let addresses = resolve(address).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "无法解析网络探针地址 `{address}`（{err}）：mDNS `.local` 名称要求设备在线且本机支持 mDNS，可直接改用设备 IP（例如 192.168.5.5）"
+                ),
+            )
+        })?;
+        if addresses.is_empty() {
+            return Err(io::Error::new(
+                ErrorKind::NotFound,
+                format!("网络探针地址 `{address}` 没有解析出任何 IP"),
+            ));
+        }
+        let address_list = addresses
+            .iter()
+            .map(|a| a.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut last_error = io::Error::new(ErrorKind::NotFound, "没有可用的地址");
+        for socket_address in addresses {
             match TcpStream::connect_timeout(&socket_address, CONNECT_TIMEOUT) {
                 Ok(stream) => {
                     stream.set_nodelay(true)?;
@@ -79,7 +98,15 @@ impl ElaphureLinkDevice {
                 Err(error) => last_error = error,
             }
         }
-        Err(last_error)
+        // elaphureLink proxies normally accept exactly one client. A second
+        // OpenOCD / probe-rs session makes the device drop SYNs, which Windows
+        // reports as a connect timeout -- not as "address in use".
+        Err(io::Error::new(
+            last_error.kind(),
+            format!(
+                "TCP 连接失败（目标 {address_list}）：{last_error}。请确认 elaphureLink 设备已上电、IP 正确、防火墙放行 TCP 3240；该代理通常只接受一个客户端，若 OpenOCD / 其它 probe-rs 实例正连着它，请先退出那个程序再连接"
+            ),
+        ))
     }
 
     /// The address the device was opened with.
@@ -98,14 +125,33 @@ impl ElaphureLinkDevice {
         self.stream.write_all(&request)?;
 
         let mut reply = [0u8; 12];
-        self.stream.read_exact(&mut reply).map_err(timed_out)?;
+        self.stream.read_exact(&mut reply).map_err(timed_out).map_err(|err| {
+            if matches!(err.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) {
+                io::Error::new(
+                    ErrorKind::TimedOut,
+                    "TCP 已连通，但 3240 端口没有回应 elaphureLink 的 12 字节握手。常见原因：该端口其实是别的服务（usbipd-win 也使用 3240），或代理唯一的客户端连接已被 OpenOCD 占用",
+                )
+            } else {
+                io::Error::new(
+                    err.kind(),
+                    format!("读取 elaphureLink 握手响应失败（连接被对方重置）: {err}"),
+                )
+            }
+        })?;
         let identifier = u32::from_be_bytes(reply[0..4].try_into().unwrap());
         let command = u32::from_be_bytes(reply[4..8].try_into().unwrap());
         let version = u32::from_be_bytes(reply[8..12].try_into().unwrap());
         if identifier != LINK_IDENTIFIER || command != COMMAND_HANDSHAKE {
+            let got = reply[..8]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
-                "invalid elaphureLink handshake response",
+                format!(
+                    "TCP 3240 上的服务不是 elaphureLink 代理：握手回执前 8 字节为 [{got}]，期望 [8a 65 6c 70 00 00 00 00]。请检查地址是否指向了别的设备/服务"
+                ),
             ));
         }
         if (version >> 16) & 0xffff < 1 {
@@ -119,7 +165,16 @@ impl ElaphureLinkDevice {
         self.stream
             .write_all(&[VENDOR_PREFIX, VENDOR_SCOPE_ENTER, 0, 0])?;
         let mut discard = [0u8; MAX_PAYLOAD];
-        let (status, _) = self.read_frame(&mut discard, HANDSHAKE_TIMEOUT)?;
+        let (status, _) = self.read_frame(&mut discard, HANDSHAKE_TIMEOUT).map_err(|err| {
+            if matches!(err.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) {
+                io::Error::new(
+                    ErrorKind::TimedOut,
+                    "设备回应了握手，但没有回应 vendor scope 切换帧（88 02 00 00）；代理可能正被其它调试器占用或固件版本不兼容",
+                )
+            } else {
+                err
+            }
+        })?;
         if status != 0 {
             return Err(io::Error::other(format!(
                 "elaphureLink vendor scope was rejected (status {status:#04x})"
@@ -439,4 +494,32 @@ mod test {
         assert!(opened, "network probe did not open");
         handle.join().unwrap();
     }
+
+    /// A refused socket must say *where* it failed and name the usual cause
+    /// (a second debugger holding the single proxy connection), instead of
+    /// surfacing a bare "connection timed out".
+    #[test]
+    fn connect_failure_names_the_stage_and_the_likely_cause() {
+        let error = ElaphureLinkDevice::connect("127.0.0.1:1").err().unwrap();
+        let text = error.to_string();
+        assert!(text.contains("TCP 连接失败"), "{text}");
+        assert!(text.contains("127.0.0.1:1"), "{text}");
+        assert!(text.contains("OpenOCD"), "{text}");
+    }
+
+    /// TCP can succeed while the port is something else entirely. That must be
+    /// reported as a handshake failure, not as a connect timeout.
+    #[test]
+    fn silent_server_is_reported_as_a_handshake_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let handle = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            thread::sleep(HANDSHAKE_TIMEOUT + Duration::from_millis(400));
+        });
+        let error = ElaphureLinkDevice::connect(&address).err().unwrap();
+        assert!(error.to_string().contains("12 字节握手"), "{error}");
+        handle.join().unwrap();
+    }
+
 }
